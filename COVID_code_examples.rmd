@@ -1,0 +1,329 @@
+---
+title: Peripheral immune signatures predict mortality and reflect respiratory tract
+  immune states in critically ill COVID-19 patients
+author: "Anthony R. Cillo, et al"
+date: "June 21, 2021"
+output:
+  pdf_document:
+    toc: yes
+    pandoc_args: --listings
+  html_document:
+    theme: yeti
+    toc: yes
+    toc_float: yes
+---
+
+# Introduction
+
+In our analysis of critically ill COVID-19 patients, we have utilized custom code in several instances. Specifically, we have written code to:
+
+  a) enable discovery of cell type specific gene modules in peripheral blood mononuclear cells; 
+  b) utilize cell type specific gene modules to predict outcome; and 
+  c) definition of a transcriptional signature of infected myeloid cells in the lower respiratory tract. 
+
+In most instances, we have not developed new computational methods but rather are leveraging parts of the extensive ecology of R packages available for analysis of scRNAseq data and for machine learning. The examples of custom code included here should help faciliate usage of similar approaches in the future. 
+
+# Defining cell type specific gene modules using SCENIC
+
+One of the central features of our analysis was to identify a granular measure of cell states using single-cell RNAseq data from PBMC obtained patients with COVID-19. To achieve this, we decided to utilize the recent Python implementation of the single-cell regulatory network inference and clustering (pySCENIC) framework. 
+
+We do the majority of our single-cell RNAseq analysis using R, so we leverage reticulate to call key functions from pySCENIC in R. The setup of a conda environment is outside the scope of this brief code documentation, but briefly we created a bioconda environment containing pySCENIC and its dependencies that we can call from R.
+
+```{r,eval=FALSE}
+
+suppressMessages({
+	library(Seurat)
+	library(SCENIC)
+	library(reticulate)
+	library(ggplot2)
+	library(tidyverse)
+})
+
+## Set up python for use in virtual env
+use_python("/ihome/crc/install/python/bioconda-3.7-2019.03/bin/python")
+use_virtualenv("/ihome/tbruno/arc85/pyscenic_reticulate/arboreto-env")
+
+## Load Seurat results
+cd4.ser <- readRDS("~/filtered_cd4_cells_seurat_object.rds")
+
+DefaultAssay(cd4.ser) <- "RNA"
+
+pbmc.cells <- colnames(cd4.ser)[cd4.ser@meta.data$sample_type=="PBMC"]
+pbmc.ser <- cd4.ser[,pbmc.cells]
+
+exprMat <- as.matrix(GetAssayData(cd4.ser[,pbmc.cells],slot="counts"))
+
+dbDir = "./reticulate"
+dbs <- list('500bp'= "hg19-500bp-upstream-7species.mc9nr.feather",
+            '10kb' = "hg19-tss-centered-10kb-7species.mc9nr.feather")
+scenicOptions <- initializeScenic(org='hgnc',
+                                  datasetTitle='SCENIC on CD4 cells',dbDir = dbDir,dbs = dbs,
+                                  nCores=4)
+
+saveRDS(scenicOptions, file="./int/scenicOptions.Rds")
+
+genesKept <- geneFiltering(exprMat, scenicOptions=scenicOptions,minCountsPerGene=3*.01*ncol(exprMat),minSamples=ncol(exprMat)*.01)
+
+exprMat_filtered <- exprMat[genesKept,]
+dim(exprMat_filtered)
+
+exprMat_filtered <- log1p(exprMat_filtered)
+exprMat_filtered <- as.matrix(exprMat_filtered)
+exportsForArboreto(exprMat_filtered,scenicOptions)
+
+runCorrelation(exprMat_filtered, scenicOptions)
+
+art <- import("arboreto")
+pd <- import("pandas")
+
+net1_ex_path = './int/1.1_exprMatrix_filtered_t.txt'
+net1_tf_path = './int/1.1_inputTFs.txt'
+
+ex_matrix = pd$read_csv(net1_ex_path, sep='\t')
+tf_names = art$utils$load_tf_names(net1_tf_path)
+
+network = art$algo$grnboost2(expression_data=ex_matrix,tf_names=tf_names)
+
+colnames(network) <- c("TF","Target","weight")
+write.csv(network, file = './output/GRNBoost_output.txt',sep='\t')
+saveRDS(network, file="./int/1.4_GENIE3_linkList.Rds")
+
+## Finalize gene sets
+
+scenicOptions <- readRDS("int/scenicOptions.rds")
+runSCENIC_1_coexNetwork2modules(scenicOptions)
+
+gene_set <- loadInt(scenicOptions,"tfModules_asDF")
+gene_set <- gene_set[gene_set$corr==1,]
+
+gene_set_top50 <- gene_set[gene_set$method == "top50perTarget",]
+gene_set_list <- split(gene_set_top50$Target,gene_set_top50$TF)
+
+sizes <- sapply(gene_set_list,length)
+
+gene_set_list <- gene_set_list[sizes>20 & sizes<200]
+
+## Calculate module scores
+
+cd4.ser.mod <- cd4.ser[,pbmc.cells]
+
+cd4.ser.mod <- AddModuleScore(cd4.ser.mod,features = gene_set_list, assay = "RNA",name=names(gene_set_list))
+
+colnames(cd4.ser.mod@meta.data)[30:ncol(cd4.ser.mod@meta.data)] <- names(gene_set_list)
+
+saveRDS(cd4.ser,file="./01_cd4_network/cd4_integrated_with_modules.20.12.04.rds")
+
+```
+
+# Utilize cell type specific gene modules to predict outcome 
+
+After identifying gene co-expression modules across all of the cell types, we next sought to utilize these granular measures of cell state on a per patient basis to determine if we could predict outcome. We used post-enrollment day 1 samples for this analysis, generated a median module score per patient, and then used machine learning algorthims provided in the R package caret to determine if immune signatures in PBMC were associated with outcome. 
+
+The structure of *mods.day1* is a data.frame that contains summarized cell type specific gene modules scores from PBMC per patient, where each row is a patient sample from a specific day and each column is a cell type specific gene module. The module scores were assigned as the median value of each gene module at each timepoint for each patient. 
+
+```{r,eval=FALSE}
+
+## Load Packages for analysis
+suppressMessages({
+  library(tidyverse)
+  library(irlba)
+  library(caret)
+  library(recipes)
+  library(GGally)
+  library(patchwork)
+  library(pROC)
+})
+
+mods.day1 <- readRDS("./aggregrated_gene_modules.21.07.14.rds")
+
+## Create splits for leave on out cross validation
+patients <- mods.day1 %>% select(patient_id) %>% data.frame()
+patients.sub <- vector("list",length=nrow(patients))
+
+for (i in 1:nrow(patients)) {
+
+  patients.sub[[i]] <- patients[-i,]
+
+}
+
+sets <- patients.sub
+
+setsFits <- setsPreds <- seeds.inner <- vector("list",length=nrow(mods.day1))
+
+names(setsFits) <- names(setsPreds) <- names(seeds.inner) <- paste("set_",1:nrow(mods.day1),sep="")
+
+#@ Seeds for each data partition
+seeds.outer <- sample.int(1000,nrow(mods.day1))
+
+## Leave one out cross validation analysis 
+for (a in 1:length(sets)) {
+
+  samples <- sets[[a]]
+  model.data <- mods.day1 %>% filter(patient_id %in% samples)
+
+  ## Identify significant modules within a given fold 
+  day1.sig.modules <- gather(model.data,"modules","values",-patient_id,-outcome) %>%
+    group_by(modules) %>%
+    summarize(pvalues=t.test(values~outcome)$p.value) %>%
+    filter(pvalues<0.05)
+
+  ## Define holdout data and variables
+  holdout.data <- mods.day1 %>%
+    filter(!patient_id %in% samples) %>%
+    select(day1.sig.modules$modules,outcome) %>%
+    data.frame()
+
+  ## Define training data and variables
+  model.data <- model.data %>%
+    select(day1.sig.modules$modules,outcome) %>%
+    data.frame()
+
+  ## Create fit control including seeds for resampling
+  ## 100 seeds for creating data splits, 101 for final model
+
+  set.seed(02221989)
+  seeds <- vector("list",length=101)
+  for (i in 1:100) seeds[[i]] <- sample.int(1000,20)
+  ## Note that the number of seeds must be equivalent to the number of rows in the parameter tuning grid for each models
+  ## BUT it can be larger - so randomly picked 20
+
+  seeds[[101]] <- sample.int(1000,1)
+
+  ## Create a fit control 
+  set.seed(seeds.outer[a])
+
+  fitControl <- trainControl(method="repeatedcv",number=10,repeats=10,classProbs=TRUE,seeds=seeds,summaryFunction=twoClassSummary,returnResamp="final",p=0.5)
+
+  ## Create a recipe for extracting meaningful PCs
+  geneRecipe <- recipe(outcome~.,data=model.data) %>%
+    step_center(all_numeric()) %>%
+    step_scale(all_numeric()) %>%
+    step_pca(all_numeric(),num_comp=2)
+
+  pca_estimates <- prep(geneRecipe,model.data)
+  baked.model.data <- bake(pca_estimates,model.data)
+  baked.model.data <- data.frame(baked.model.data)
+
+  models <- c("ranger","glmnet","svmLinearWeights","nnet")
+  fitsGene <- vector("list",length=length(models))
+  names(fitsGene) <- models
+
+  ## Fit models in a loop
+  for (i in 1:length(fitsGene)) {
+    capture.fit <- capture.output(fitsGene[[i]] <-                             train(outcome~.,baked.model.data,method=models[i],trControl=fitControl,metric="ROC"))
+  }
+
+  setsFits[[a]] <- fitsGene
+
+  ## Compare model performance on hold-out data
+  baked.holdout.data <- bake(pca_estimates,holdout.data)
+  baked.holdout.data <- data.frame(baked.holdout.data)
+
+  predictions <- vector("list",length=length(models))
+  names(predictions) <- models
+
+  for (i in 1:length(predictions)) {
+    actual.res <- baked.holdout.data$outcome
+    mod.pred.prob <- predict(fitsGene[[i]],newdata=baked.holdout.data,type="prob")
+    predictions[[i]] <- list("Outcome"=actual.res,"Prediction"=mod.pred.prob)
+  }
+
+  seeds.inner[[a]] <- seeds
+  setsPreds[[a]] <- predictions
+
+}
+
+## Save output 
+saveRDS(seeds.inner,seeds.outer,setsPreds,file="./cross_validation_analysis.rds")
+
+```
+
+# Meta-analysis of an infected myeloid signature across scRNAseq studies
+
+A final analytical approach employed was to perform a meta-analysis across datasets of lower respiratory tract cells single-cell RNAseq datasets to identify genes that were consistently expressed in infected myeloid cells within the lung. 
+
+To do this, we leveraged 4 existing single-cell RNAseq datasets. In each dataset, we determined the log fold-change in gene expression for each indidivual patient in each cluster. Then, we summarized the mean and standard deviation of the log fold-change across genes for each study. Finally, we identified the myeloid cluster with the highest frequency of cells harboring SARS-COV-2 transcripts, and determined a weighted average of the mean log fold-change based on the number of patients in each study. 
+
+The code below relies on the metadata from each individual study, and a list of summarized genes per cluster from each study.
+
+```{r,eval=FALSE}
+
+suppressMessages({
+  library(tidyverse)
+  library(ggplot2)
+})
+
+## Load individual analysis
+liao.meta <- readRDS("liao_et_al_analysis_metadata.rds")
+liao.tib <- readRDS("liao_et_al_patient_summarized_degs.rds")
+
+ren.meta <- readRDS("ren_et_al_analysis_metadata.rds")
+ren.tib <- readRDS("ren_et_al_patient_summarized_degs.rds")
+
+grant.meta <- readRDS("grant_et_al_analysis_metadata.rds")
+grant.tib <- readRDS("grant_et_al_patient_summarized_degs.rds")
+
+delorey.meta <- readRDS("delorey_et_al_analysis_metadata.rds")
+delorey.tib <- readRDS("delorey_et_al_patient_summarized_degs.rds")
+
+## Identify most highly infected myeloid cluster 
+liao.meta %>%
+	mutate(sars_pos=ifelse(sars_counts>0,1,0)) %>%
+	group_by(sample,RNA_snn_res.0.3) %>%
+	mutate(sample_counts=n()) %>%
+	filter(sample_counts>25) %>%
+	summarize(sars_freq=sum(sars_pos)/n()) %>%
+	ungroup() %>%
+	group_by(RNA_snn_res.0.3) %>%
+	summarize(mean_clust=mean(sars_freq),sd_cluster=sd(sars_freq))
+
+ren.meta %>%
+	group_by(sampleID,RNA_snn_res.0.5) %>%
+	mutate(sample_counts=n()) %>%
+	filter(sample_counts>25) %>%
+	summarize(sars_freq=sum(sars_pos)/n()) %>%
+	ungroup() %>%
+	group_by(RNA_snn_res.0.5) %>%
+	summarize(mean_clust=mean(sars_freq),sd_cluster=sd(sars_freq))
+
+grant.meta %>%
+	mutate(sars_pos=ifelse(`No.of.SARS.CoV.2.genes`>0,1,0)) %>%
+	group_by(Patient,RNA_snn_res.0.3) %>%
+	mutate(sample_counts=n()) %>%
+	filter(sample_counts>25) %>%
+	summarize(sars_freq=sum(sars_pos)/n()) %>%
+	ungroup() %>%
+	group_by(RNA_snn_res.0.3) %>%
+	summarize(mean_clust=mean(sars_freq,na.rm=T),sd_cluster=sd(sars_freq,na.rm=T))
+
+delorey.meta %>%
+	mutate(sars_pos=ifelse(`Viral.`>0,1,0)) %>%
+	group_by(donor,RNA_snn_res.0.5) %>%
+	mutate(sample_counts=n()) %>%
+	filter(sample_counts>25) %>%
+	summarize(sars_freq=sum(sars_pos)/n()) %>%
+	ungroup() %>%
+	group_by(RNA_snn_res.0.5) %>%
+	summarize(mean_clust=mean(sars_freq,na.rm=T),sd_cluster=sd(sars_freq,na.rm=T)) %>%
+	data.frame()
+
+## Combine individual study summarized logFC genes 
+delorey.tib <- enframe(delorey.mean.frames[[3]],name="genes")
+
+grant.tib <- enframe(grant.mean.frames[[5]],name="genes")
+
+ren.tib <- enframe(ren.mean.frames[[6]],name="genes")
+
+liao.tib <- enframe(liao.mean.frames[[5]],name="genes")
+
+dat.join <- list(delorey.tib,grant.tib,ren.tib,liao.tib) %>%
+	reduce(inner_join,by="genes")
+
+colnames(dat.join) <- c("genes","delorey","grant","ren","liao")
+
+dat.join <- dat.join %>%
+	group_by(genes) %>%
+	mutate(weighted_mean=( (delorey*17) + (grant*12) + (ren*33) + (liao*12) ) / ( 12+17+33+12 ) ) %>%
+	ungroup()
+
+```
