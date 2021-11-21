@@ -17,15 +17,15 @@ output:
 
 In our analysis of critically ill COVID-19 patients, we have utilized custom code in several instances. Specifically, we have written code to:
 
-  a) enable discovery of cell type specific gene modules in peripheral blood mononuclear cells; 
-  b) utilize cell type specific gene modules to predict outcome; and 
-  c) definition of a transcriptional signature of infected myeloid cells in the lower respiratory tract. 
+  a) enable discovery of cell type specific gene modules in peripheral blood mononuclear cells;
+  b) utilize cell type specific gene modules to predict outcome; and
+  c) definition of a transcriptional signature of infected myeloid cells in the lower respiratory tract.
 
-In most instances, we have not developed new computational methods but rather are leveraging parts of the extensive ecology of R packages available for analysis of scRNAseq data and for machine learning. The examples of custom code included here should help faciliate usage of similar approaches in the future. 
+In most instances, we have not developed new computational methods but rather are leveraging parts of the extensive ecology of R packages available for analysis of scRNAseq data and for machine learning. The examples of custom code included will facilitate usage of similar approaches.
 
 # Defining cell type specific gene modules using SCENIC
 
-One of the central features of our analysis was to identify a granular measure of cell states using single-cell RNAseq data from PBMC obtained patients with COVID-19. To achieve this, we decided to utilize the recent Python implementation of the single-cell regulatory network inference and clustering (pySCENIC) framework. 
+One of the central features of our analysis was to identify a granular measure of cell states using single-cell RNAseq data from PBMC obtained patients with COVID-19. To achieve this, we decided to utilize the recent Python implementation of the single-cell regulatory network inference and clustering (pySCENIC) framework.
 
 We do the majority of our single-cell RNAseq analysis using R, so we leverage reticulate to call key functions from pySCENIC in R. The setup of a conda environment is outside the scope of this brief code documentation, but briefly we created a bioconda environment containing pySCENIC and its dependencies that we can call from R.
 
@@ -115,11 +115,11 @@ saveRDS(cd4.ser,file="./01_cd4_network/cd4_integrated_with_modules.20.12.04.rds"
 
 ```
 
-# Utilize cell type specific gene modules to predict outcome 
+# Utilize cell type specific gene modules to predict outcome
 
-After identifying gene co-expression modules across all of the cell types, we next sought to utilize these granular measures of cell state on a per patient basis to determine if we could predict outcome. We used post-enrollment day 1 samples for this analysis, generated a median module score per patient, and then used machine learning algorthims provided in the R package caret to determine if immune signatures in PBMC were associated with outcome. 
+After identifying gene co-expression modules across all of the cell types, we next sought to utilize these granular measures of cell state on a per patient basis to determine if we could predict outcome. We used post-enrollment day 1 samples for this analysis, generated a median module score per patient, and then used machine learning algorthims provided in the R package caret to determine if immune signatures in PBMC were associated with outcome.
 
-The structure of *mods.day1* is a data.frame that contains summarized cell type specific gene modules scores from PBMC per patient, where each row is a patient sample from a specific day and each column is a cell type specific gene module. The module scores were assigned as the median value of each gene module at each timepoint for each patient. 
+The structure of *mods.day1* is a data.frame that contains summarized cell type specific gene modules scores from PBMC per patient, where each row is a patient sample from a specific day and each column is a cell type specific gene module. The module scores were assigned as the median value of each gene module at each timepoint for each patient.
 
 ```{r,eval=FALSE}
 
@@ -155,13 +155,13 @@ names(setsFits) <- names(setsPreds) <- names(seeds.inner) <- paste("set_",1:nrow
 #@ Seeds for each data partition
 seeds.outer <- sample.int(1000,nrow(mods.day1))
 
-## Leave one out cross validation analysis 
+## Leave one out cross validation analysis
 for (a in 1:length(sets)) {
 
   samples <- sets[[a]]
   model.data <- mods.day1 %>% filter(patient_id %in% samples)
 
-  ## Identify significant modules within a given fold 
+  ## Identify significant modules within a given fold
   day1.sig.modules <- gather(model.data,"modules","values",-patient_id,-outcome) %>%
     group_by(modules) %>%
     summarize(pvalues=t.test(values~outcome)$p.value) %>%
@@ -189,7 +189,7 @@ for (a in 1:length(sets)) {
 
   seeds[[101]] <- sample.int(1000,1)
 
-  ## Create a fit control 
+  ## Create a fit control
   set.seed(seeds.outer[a])
 
   fitControl <- trainControl(method="repeatedcv",number=10,repeats=10,classProbs=TRUE,seeds=seeds,summaryFunction=twoClassSummary,returnResamp="final",p=0.5)
@@ -233,16 +233,16 @@ for (a in 1:length(sets)) {
 
 }
 
-## Save output 
+## Save output
 saveRDS(seeds.inner,seeds.outer,setsPreds,file="./cross_validation_analysis.rds")
 
 ```
 
 # Meta-analysis of an infected myeloid signature across scRNAseq studies
 
-A final analytical approach employed was to perform a meta-analysis across datasets of lower respiratory tract cells single-cell RNAseq datasets to identify genes that were consistently expressed in infected myeloid cells within the lung. 
+A final analytical approach employed was to perform a meta-analysis across datasets of lower respiratory tract cells single-cell RNAseq datasets to identify genes that were consistently expressed in infected myeloid cells within the lung.
 
-To do this, we leveraged 4 existing single-cell RNAseq datasets. In each dataset, we determined the log fold-change in gene expression for each indidivual patient in each cluster. Then, we summarized the mean and standard deviation of the log fold-change across genes for each study. Finally, we identified the myeloid cluster with the highest frequency of cells harboring SARS-COV-2 transcripts, and determined a weighted average of the mean log fold-change based on the number of patients in each study. 
+To do this, we leveraged 4 existing single-cell RNAseq datasets. In each dataset, we determined the log fold-change in gene expression for each indidivual patient in each cluster. Then, we summarized the mean and standard deviation of the log fold-change across genes for each study. Finally, we identified the myeloid cluster with the highest frequency of cells harboring SARS-COV-2 transcripts, and determined a weighted average of the mean log fold-change based on the number of patients in each study.
 
 The code below relies on the metadata from each individual study, and a list of summarized genes per cluster from each study.
 
@@ -266,7 +266,7 @@ grant.tib <- readRDS("grant_et_al_patient_summarized_degs.rds")
 delorey.meta <- readRDS("delorey_et_al_analysis_metadata.rds")
 delorey.tib <- readRDS("delorey_et_al_patient_summarized_degs.rds")
 
-## Identify most highly infected myeloid cluster 
+## Identify most highly infected myeloid cluster
 liao.meta %>%
 	mutate(sars_pos=ifelse(sars_counts>0,1,0)) %>%
 	group_by(sample,RNA_snn_res.0.3) %>%
@@ -307,7 +307,7 @@ delorey.meta %>%
 	summarize(mean_clust=mean(sars_freq,na.rm=T),sd_cluster=sd(sars_freq,na.rm=T)) %>%
 	data.frame()
 
-## Combine individual study summarized logFC genes 
+## Combine individual study summarized logFC genes
 delorey.tib <- enframe(delorey.mean.frames[[3]],name="genes")
 
 grant.tib <- enframe(grant.mean.frames[[5]],name="genes")
